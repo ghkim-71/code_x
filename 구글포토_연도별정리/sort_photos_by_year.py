@@ -9,6 +9,11 @@
 
 사용법:
   python3 sort_photos_by_year.py <테이크아웃_압축해제_폴더> <결과_폴더> [--move] [--dry-run]
+  python3 sort_photos_by_year.py <원본> <결과> --year 2020 --by-month   # 2020년만 월별로
+
+--by-month 를 주면 "2020년/01월" 처럼 월 폴더까지 만듭니다.
+--year 를 주면 그 연도의 사진만 처리합니다.
+촬영 시각은 기본적으로 한국 시간(UTC+9)으로 계산합니다(--utc-offset 으로 변경).
 
 기본값은 '복사'이므로 원본은 그대로 남습니다. --move 를 주면 이동합니다.
 """
@@ -17,7 +22,7 @@ import json
 import re
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 MEDIA_EXT = {
@@ -52,18 +57,19 @@ def find_sidecar(media: Path, json_by_dir: dict) -> Path | None:
     return best
 
 
-def year_from_json(path: Path) -> int | None:
+def date_from_json(path: Path, tz: timezone) -> tuple | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         ts = int(data["photoTakenTime"]["timestamp"])
         if ts > 0:
-            return datetime.fromtimestamp(ts, tz=timezone.utc).year
+            d = datetime.fromtimestamp(ts, tz=tz)
+            return d.year, d.month
     except Exception:
         pass
     return None
 
 
-def year_from_exif(path: Path) -> int | None:
+def date_from_exif(path: Path) -> tuple | None:
     try:
         from PIL import Image  # 선택 사항
     except ImportError:
@@ -73,20 +79,20 @@ def year_from_exif(path: Path) -> int | None:
             exif = img.getexif()
             raw = exif.get_ifd(0x8769).get(36867) or exif.get(306)  # DateTimeOriginal / DateTime
             if raw:
-                y = int(str(raw)[:4])
-                if 1970 <= y <= datetime.now().year:
-                    return y
+                y, mo = int(str(raw)[:4]), int(str(raw)[5:7])
+                if 1970 <= y <= datetime.now().year and 1 <= mo <= 12:
+                    return y, mo
     except Exception:
         pass
     return None
 
 
-def year_from_name(path: Path) -> int | None:
+def date_from_name(path: Path) -> tuple | None:
     m = NAME_DATE.search(path.name)
     if m:
         y = int(m.group(1))
         if y <= datetime.now().year:
-            return y
+            return y, int(m.group(2))
     return None
 
 
@@ -105,7 +111,11 @@ def main() -> int:
     ap.add_argument("dest", type=Path, help="연도별 폴더를 만들 결과 폴더")
     ap.add_argument("--move", action="store_true", help="복사 대신 이동")
     ap.add_argument("--dry-run", action="store_true", help="실제로 옮기지 않고 결과만 표시")
+    ap.add_argument("--by-month", action="store_true", help="연도 폴더 안에 월 폴더(01월~12월)까지 생성")
+    ap.add_argument("--year", type=int, help="이 연도의 사진만 처리 (예: 2020)")
+    ap.add_argument("--utc-offset", type=float, default=9, help="촬영 시각 계산용 시간대 (기본 9 = 한국)")
     args = ap.parse_args()
+    tz = timezone(timedelta(hours=args.utc_offset))
 
     if not args.source.is_dir():
         print(f"원본 폴더가 없습니다: {args.source}", file=sys.stderr)
@@ -121,8 +131,15 @@ def main() -> int:
     counts: dict = {}
     for p in sorted(media):
         sidecar = find_sidecar(p, json_by_dir)
-        year = (year_from_json(sidecar) if sidecar else None) or year_from_exif(p) or year_from_name(p)
-        folder = f"{year}년" if year else UNKNOWN
+        date = (date_from_json(sidecar, tz) if sidecar else None) or date_from_exif(p) or date_from_name(p)
+        if args.year and (not date or date[0] != args.year):
+            continue  # 연도를 지정했으면 날짜를 모르는 사진과 다른 연도 사진은 건너뜀
+        if not date:
+            folder = UNKNOWN
+        elif args.by_month:
+            folder = f"{date[0]}년/{date[1]:02d}월"
+        else:
+            folder = f"{date[0]}년"
         counts[folder] = counts.get(folder, 0) + 1
         dest_dir = args.dest / folder
         if args.dry_run:
@@ -131,7 +148,7 @@ def main() -> int:
         target = unique_target(dest_dir, p.name)
         (shutil.move if args.move else shutil.copy2)(str(p), str(target))
 
-    print(f"처리한 사진·동영상: {len(media)}개" + (" (미리보기, 실제 변경 없음)" if args.dry_run else ""))
+    print(f"처리한 사진·동영상: {sum(counts.values())}개" + (" (미리보기, 실제 변경 없음)" if args.dry_run else ""))
     for folder in sorted(counts):
         print(f"  {folder}: {counts[folder]}개")
     return 0
